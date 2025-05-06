@@ -230,3 +230,119 @@
     (ok investor-revenue)
   )
 )
+
+
+(define-map project-updates
+  { project-id: uint, update-id: uint }
+  {
+    title: (string-ascii 64),
+    content: (string-ascii 512),
+    timestamp: uint
+  }
+)
+
+(define-map project-update-counts
+  { project-id: uint }
+  { count: uint }
+)
+
+(define-read-only (get-project-update (project-id uint) (update-id uint))
+  (map-get? project-updates { project-id: project-id, update-id: update-id })
+)
+
+(define-public (post-project-update (project-id uint) (title (string-ascii 64)) (content (string-ascii 512)))
+  (let 
+    (
+      (project (unwrap! (get-project project-id) err-not-found))
+      (update-count (default-to { count: u0 } (map-get? project-update-counts { project-id: project-id })))
+      (new-update-id (get count update-count))
+    )
+    (asserts! (is-eq (get farmer project) tx-sender) err-unauthorized)
+    
+    (map-set project-updates
+      { project-id: project-id, update-id: new-update-id }
+      {
+        title: title,
+        content: content,
+        timestamp: stacks-block-height
+      }
+    )
+    
+    (map-set project-update-counts
+      { project-id: project-id }
+      { count: (+ new-update-id u1) }
+    )
+    
+    (ok new-update-id)
+  )
+)
+
+
+(define-public (get-project-updates (project-id uint))
+  (let ((update-count (default-to { count: u0 } (map-get? project-update-counts { project-id: project-id }))))
+    (ok update-count)
+  )
+)
+
+(define-public (get-project-update-count (project-id uint))
+  (let ((update-count (default-to { count: u0 } (map-get? project-update-counts { project-id: project-id }))))
+    (ok update-count)
+  )
+)
+(define-public (get-project-update-by-id (project-id uint) (update-id uint))
+  (let ((update (unwrap! (get-project-update project-id update-id) err-not-found)))
+    (ok update)
+  )
+)
+
+(define-map project-ratings
+  { project-id: uint, investor: principal }
+  {
+    rating: uint,
+    comment: (string-ascii 256)
+  }
+)
+
+(define-map project-rating-stats
+  { project-id: uint }
+  {
+    total-ratings: uint,
+    sum-ratings: uint
+  }
+)
+
+(define-read-only (get-project-rating (project-id uint) (investor principal))
+  (map-get? project-ratings { project-id: project-id, investor: investor })
+)
+
+(define-public (rate-project (project-id uint) (rating uint) (comment (string-ascii 256)))
+  (let 
+    (
+      (project (unwrap! (get-project project-id) err-not-found))
+      (investment (unwrap! (get-investment project-id tx-sender) err-not-found))
+      (stats (default-to { total-ratings: u0, sum-ratings: u0 } 
+              (map-get? project-rating-stats { project-id: project-id })))
+    )
+    (asserts! (not (get is-active project)) err-funding-active)
+    (asserts! (>= rating u1) (err u1))
+    (asserts! (<= rating u5) (err u2))
+    
+    (map-set project-ratings
+      { project-id: project-id, investor: tx-sender }
+      { 
+        rating: rating,
+        comment: comment
+      }
+    )
+    
+    (map-set project-rating-stats
+      { project-id: project-id }
+      {
+        total-ratings: (+ (get total-ratings stats) u1),
+        sum-ratings: (+ (get sum-ratings stats) rating)
+      }
+    )
+    
+    (ok true)
+  )
+)
