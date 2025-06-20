@@ -12,6 +12,36 @@
 (define-constant err-no-revenue (err u110))
 (define-constant err-already-claimed (err u111))
 
+
+(define-map project-milestones
+  { project-id: uint, milestone-id: uint }
+  {
+    title: (string-ascii 64),
+    description: (string-ascii 256),
+    funding-amount: uint,
+    is-completed: bool,
+    is-approved: bool,
+    votes-for: uint,
+    votes-against: uint,
+    total-voters: uint
+  }
+)
+
+(define-map milestone-counts
+  { project-id: uint }
+  { count: uint }
+)
+
+(define-map milestone-votes
+  { project-id: uint, milestone-id: uint, voter: principal }
+  { voted: bool, vote-type: bool }
+)
+
+(define-map milestone-funds
+  { project-id: uint }
+  { total-milestone-amount: uint, released-amount: uint }
+)
+
 (define-non-fungible-token farm-share uint)
 
 (define-map projects
@@ -345,4 +375,147 @@
     
     (ok true)
   )
+)
+
+
+(define-read-only (get-milestone (project-id uint) (milestone-id uint))
+  (map-get? project-milestones { project-id: project-id, milestone-id: milestone-id })
+)
+
+(define-read-only (get-milestone-count (project-id uint))
+  (default-to { count: u0 } (map-get? milestone-counts { project-id: project-id }))
+)
+
+(define-read-only (get-milestone-funds (project-id uint))
+  (default-to { total-milestone-amount: u0, released-amount: u0 } 
+    (map-get? milestone-funds { project-id: project-id }))
+)
+
+(define-public (add-milestone (project-id uint) (title (string-ascii 64)) (description (string-ascii 256)) (funding-amount uint))
+  (let 
+    (
+      (project (unwrap! (get-project project-id) err-not-found))
+      (milestone-count (get-milestone-count project-id))
+      (new-milestone-id (get count milestone-count))
+      (current-funds (get-milestone-funds project-id))
+    )
+    (asserts! (is-eq (get farmer project) tx-sender) err-unauthorized)
+    (asserts! (get is-active project) err-funding-closed)
+    (asserts! (> funding-amount u0) (err u0))
+    
+    (map-set project-milestones
+      { project-id: project-id, milestone-id: new-milestone-id }
+      {
+        title: title,
+        description: description,
+        funding-amount: funding-amount,
+        is-completed: false,
+        is-approved: false,
+        votes-for: u0,
+        votes-against: u0,
+        total-voters: u0
+      }
+    )
+    
+    (map-set milestone-counts
+      { project-id: project-id }
+      { count: (+ new-milestone-id u1) }
+    )
+    
+    (map-set milestone-funds
+      { project-id: project-id }
+      {
+        total-milestone-amount: (+ (get total-milestone-amount current-funds) funding-amount),
+        released-amount: (get released-amount current-funds)
+      }
+    )
+    
+    (ok new-milestone-id)
+  )
+)
+
+(define-public (complete-milestone (project-id uint) (milestone-id uint))
+  (let 
+    (
+      (project (unwrap! (get-project project-id) err-not-found))
+      (milestone (unwrap! (get-milestone project-id milestone-id) err-not-found))
+    )
+    (asserts! (is-eq (get farmer project) tx-sender) err-unauthorized)
+    (asserts! (not (get is-completed milestone)) err-already-exists)
+    
+    (map-set project-milestones
+      { project-id: project-id, milestone-id: milestone-id }
+      (merge milestone { is-completed: true })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (vote-milestone (project-id uint) (milestone-id uint) (approve bool))
+  (let 
+    (
+      (project (unwrap! (get-project project-id) err-not-found))
+      (milestone (unwrap! (get-milestone project-id milestone-id) err-not-found))
+      (investment (unwrap! (get-investment project-id tx-sender) err-not-found))
+      (existing-vote (default-to { voted: false, vote-type: false } 
+                      (map-get? milestone-votes { project-id: project-id, milestone-id: milestone-id, voter: tx-sender })))
+    )
+    (asserts! (get is-completed milestone) (err u0))
+    (asserts! (not (get is-approved milestone)) err-already-exists)
+    (asserts! (not (get voted existing-vote)) err-already-exists)
+    (asserts! (> (get amount investment) u0) err-unauthorized)
+    
+    (map-set milestone-votes
+      { project-id: project-id, milestone-id: milestone-id, voter: tx-sender }
+      { voted: true, vote-type: approve }
+    )
+    
+    (map-set project-milestones
+      { project-id: project-id, milestone-id: milestone-id }
+      (merge milestone {
+        votes-for: (if approve (+ (get votes-for milestone) u1) (get votes-for milestone)),
+        votes-against: (if approve (get votes-against milestone) (+ (get votes-against milestone) u1)),
+        total-voters: (+ (get total-voters milestone) u1)
+      })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (release-milestone-funds (project-id uint) (milestone-id uint))
+  (let 
+    (
+      (project (unwrap! (get-project project-id) err-not-found))
+      (milestone (unwrap! (get-milestone project-id milestone-id) err-not-found))
+      (current-funds (get-milestone-funds project-id))
+      (approval-threshold (/ (get total-shares project) u2))
+    )
+    (asserts! (is-eq (get farmer project) tx-sender) err-unauthorized)
+    (asserts! (get is-completed milestone) (err u0))
+    (asserts! (not (get is-approved milestone)) err-already-exists)
+    (asserts! (> (get votes-for milestone) approval-threshold) (err u0))
+    
+    (map-set project-milestones
+      { project-id: project-id, milestone-id: milestone-id }
+      (merge milestone { is-approved: true })
+    )
+    
+    (map-set milestone-funds
+      { project-id: project-id }
+      {
+        total-milestone-amount: (get total-milestone-amount current-funds),
+        released-amount: (+ (get released-amount current-funds) (get funding-amount milestone))
+      }
+    )
+    
+    (try! (as-contract (stx-transfer? (get funding-amount milestone) tx-sender (get farmer project))))
+    
+    (ok (get funding-amount milestone))
+  )
+)
+
+(define-read-only (get-milestone-vote (project-id uint) (milestone-id uint) (voter principal))
+  (map-get? milestone-votes { project-id: project-id, milestone-id: milestone-id, voter: voter })
 )
