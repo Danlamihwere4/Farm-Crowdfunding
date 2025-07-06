@@ -519,3 +519,224 @@
 (define-read-only (get-milestone-vote (project-id uint) (milestone-id uint) (voter principal))
   (map-get? milestone-votes { project-id: project-id, milestone-id: milestone-id, voter: voter })
 )
+
+
+(define-map investor-preferences
+  { investor: principal }
+  {
+    min-target-amount: uint,
+    max-target-amount: uint,
+    preferred-categories: (list 5 (string-ascii 32)),
+    max-investment-per-project: uint,
+    auto-invest-enabled: bool,
+    auto-invest-percentage: uint
+  }
+)
+
+(define-map project-categories
+  { project-id: uint }
+  {
+    primary-category: (string-ascii 32),
+    secondary-categories: (list 3 (string-ascii 32))
+  }
+)
+
+(define-map investment-matches
+  { match-id: uint }
+  {
+    investor: principal,
+    project-id: uint,
+    match-score: uint,
+    created-at: uint,
+    is-notified: bool,
+    auto-invested: bool
+  }
+)
+
+(define-map investor-match-counts
+  { investor: principal }
+  { count: uint }
+)
+
+(define-data-var next-match-id uint u1)
+
+(define-read-only (get-investor-preferences (investor principal))
+  (map-get? investor-preferences { investor: investor })
+)
+
+(define-read-only (get-project-category (project-id uint))
+  (map-get? project-categories { project-id: project-id })
+)
+
+(define-read-only (get-investment-match (match-id uint))
+  (map-get? investment-matches { match-id: match-id })
+)
+
+(define-read-only (get-investor-match-count (investor principal))
+  (default-to { count: u0 } (map-get? investor-match-counts { investor: investor }))
+)
+
+(define-public (set-investor-preferences 
+  (min-target uint) 
+  (max-target uint) 
+  (categories (list 5 (string-ascii 32))) 
+  (max-investment uint) 
+  (auto-invest bool) 
+  (auto-percentage uint))
+  (begin
+    (asserts! (<= min-target max-target) (err u201))
+    (asserts! (> max-investment u0) (err u202))
+    (asserts! (<= auto-percentage u100) (err u203))
+    
+    (map-set investor-preferences
+      { investor: tx-sender }
+      {
+        min-target-amount: min-target,
+        max-target-amount: max-target,
+        preferred-categories: categories,
+        max-investment-per-project: max-investment,
+        auto-invest-enabled: auto-invest,
+        auto-invest-percentage: auto-percentage
+      }
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (set-project-category 
+  (project-id uint) 
+  (primary-category (string-ascii 32)) 
+  (secondary-categories (list 3 (string-ascii 32))))
+  (let ((project (unwrap! (get-project project-id) err-not-found)))
+    (asserts! (is-eq (get farmer project) tx-sender) err-unauthorized)
+    
+    (map-set project-categories
+      { project-id: project-id }
+      {
+        primary-category: primary-category,
+        secondary-categories: secondary-categories
+      }
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (create-investment-match (investor principal) (project-id uint) (score uint))
+  (let 
+    (
+      (match-id (var-get next-match-id))
+      (investor-matches (get-investor-match-count investor))
+    )
+    (asserts! (is-some (get-project project-id)) err-not-found)
+    (asserts! (<= score u100) (err u204))
+    
+    (map-set investment-matches
+      { match-id: match-id }
+      {
+        investor: investor,
+        project-id: project-id,
+        match-score: score,
+        created-at: stacks-block-height,
+        is-notified: false,
+        auto-invested: false
+      }
+    )
+    
+    (map-set investor-match-counts
+      { investor: investor }
+      { count: (+ (get count investor-matches) u1) }
+    )
+    
+    (var-set next-match-id (+ match-id u1))
+    
+    (ok match-id)
+  )
+)
+
+(define-public (calculate-match-score (investor principal) (project-id uint))
+  (let 
+    (
+      (project (unwrap! (get-project project-id) err-not-found))
+      (preferences (unwrap! (get-investor-preferences investor) (err u205)))
+      (categories (get-project-category project-id))
+      (target-amount (get target-amount project))
+      (base-score u0)
+    )
+    (asserts! (get is-active project) err-funding-closed)
+    
+    (let 
+      (
+        (target-match (if (and (>= target-amount (get min-target-amount preferences))
+                              (<= target-amount (get max-target-amount preferences)))
+                        u40 u0))
+        (category-match (if (is-some categories) 
+                          (if (is-eq (get primary-category (unwrap-panic categories)) 
+                                    (unwrap-panic (element-at (get preferred-categories preferences) u0)))
+                            u40 u20) u0))
+        (timing-bonus (if (< (get current-amount project) (/ (get target-amount project) u4)) u20 u0))
+        (total-score (+ base-score target-match category-match timing-bonus))
+      )
+      (if (> total-score u60)
+        (begin
+          (try! (create-investment-match investor project-id total-score))
+          (ok total-score))
+        (ok total-score))
+    )
+  )
+)
+
+(define-public (process-auto-investment (match-id uint))
+  (let 
+    (
+      (match-data (unwrap! (get-investment-match match-id) err-not-found))
+      (investor (get investor match-data))
+      (project-id (get project-id match-data))
+      (preferences (unwrap! (get-investor-preferences investor) (err u205)))
+      (project (unwrap! (get-project project-id) err-not-found))
+    )
+    (asserts! (get auto-invest-enabled preferences) (err u206))
+    (asserts! (not (get auto-invested match-data)) err-already-exists)
+    (asserts! (get is-active project) err-funding-closed)
+    
+    (let 
+      (
+        (percentage-amount (/ (* (get max-investment-per-project preferences) 
+                                (get auto-invest-percentage preferences)) u100))
+        (investment-amount (if (<= percentage-amount (get max-investment-per-project preferences))
+                              percentage-amount
+                              (get max-investment-per-project preferences)))
+      )
+      (asserts! (>= investment-amount (get min-investment project)) err-min-investment)
+      
+      (map-set investment-matches
+        { match-id: match-id }
+        (merge match-data { auto-invested: true })
+      )
+      
+      (try! (invest project-id investment-amount))
+      
+      (ok investment-amount)
+    )
+  )
+)
+
+(define-public (notify-match (match-id uint))
+  (let ((match-data (unwrap! (get-investment-match match-id) err-not-found)))
+    (asserts! (not (get is-notified match-data)) err-already-exists)
+    
+    (map-set investment-matches
+      { match-id: match-id }
+      (merge match-data { is-notified: true })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-read-only (get-investor-active-matches (investor principal))
+  (let ((match-count (get-investor-match-count investor)))
+    (ok (get count match-count))
+  )
+)
