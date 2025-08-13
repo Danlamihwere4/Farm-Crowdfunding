@@ -11,6 +11,11 @@
 (define-constant err-target-not-reached (err u109))
 (define-constant err-no-revenue (err u110))
 (define-constant err-already-claimed (err u111))
+(define-constant err-insurance-not-found (err u112))
+(define-constant err-claim-expired (err u113))
+(define-constant err-invalid-claim-type (err u114))
+(define-constant err-insufficient-pool-funds (err u115))
+(define-constant err-premium-too-low (err u116))
 
 
 (define-map project-milestones
@@ -740,3 +745,316 @@
     (ok (get count match-count))
   )
 )
+
+;; Farm Insurance Pool System - Protects investments against agricultural risks
+(define-map insurance-pools
+  { pool-id: uint }
+  {
+    name: (string-ascii 64),
+    total-pool-amount: uint,
+    active-coverage: uint,
+    premium-rate: uint, ;; basis points (e.g., 500 = 5%)
+    max-claim-amount: uint,
+    pool-creator: principal,
+    is-active: bool,
+    claim-count: uint
+  }
+)
+
+(define-map pool-contributors
+  { pool-id: uint, contributor: principal }
+  {
+    contributed-amount: uint,
+    share-percentage: uint,
+    rewards-earned: uint
+  }
+)
+
+(define-map project-insurance
+  { project-id: uint }
+  {
+    pool-id: uint,
+    premium-paid: uint,
+    coverage-amount: uint,
+    coverage-start: uint,
+    coverage-end: uint,
+    is-covered: bool
+  }
+)
+
+(define-map insurance-claims
+  { claim-id: uint }
+  {
+    project-id: uint,
+    pool-id: uint,
+    claimant: principal,
+    claim-type: uint, ;; 1=crop failure, 2=weather damage, 3=disease, 4=market crash
+    claim-amount: uint,
+    evidence-hash: (string-ascii 64),
+    submitted-at: uint,
+    status: uint, ;; 0=pending, 1=approved, 2=rejected, 3=paid
+    votes-for: uint,
+    votes-against: uint,
+    total-voters: uint
+  }
+)
+
+(define-map claim-votes
+  { claim-id: uint, voter: principal }
+  {
+    voted: bool,
+    vote-type: bool, ;; true=approve, false=reject
+    voting-power: uint
+  }
+)
+
+(define-data-var next-pool-id uint u1)
+(define-data-var next-claim-id uint u1)
+
+;; Read-only functions for insurance system
+(define-read-only (get-insurance-pool (pool-id uint))
+  (map-get? insurance-pools { pool-id: pool-id })
+)
+
+(define-read-only (get-pool-contribution (pool-id uint) (contributor principal))
+  (map-get? pool-contributors { pool-id: pool-id, contributor: contributor })
+)
+
+(define-read-only (get-project-insurance-info (project-id uint))
+  (map-get? project-insurance { project-id: project-id })
+)
+
+(define-read-only (get-insurance-claim (claim-id uint))
+  (map-get? insurance-claims { claim-id: claim-id })
+)
+
+(define-read-only (get-claim-vote (claim-id uint) (voter principal))
+  (map-get? claim-votes { claim-id: claim-id, voter: voter })
+)
+
+;; Create a new insurance pool for farm projects
+(define-public (create-insurance-pool 
+  (name (string-ascii 64)) 
+  (premium-rate uint) 
+  (max-claim-amount uint))
+  (let ((pool-id (var-get next-pool-id)))
+    (asserts! (> premium-rate u0) (err u300))
+    (asserts! (< premium-rate u1000) (err u301)) ;; Max 10% premium rate
+    (asserts! (> max-claim-amount u0) (err u302))
+    
+    (map-set insurance-pools
+      { pool-id: pool-id }
+      {
+        name: name,
+        total-pool-amount: u0,
+        active-coverage: u0,
+        premium-rate: premium-rate,
+        max-claim-amount: max-claim-amount,
+        pool-creator: tx-sender,
+        is-active: true,
+        claim-count: u0
+      }
+    )
+    
+    (var-set next-pool-id (+ pool-id u1))
+    (ok pool-id)
+  )
+)
+
+;; Contribute funds to an insurance pool to earn premium rewards
+(define-public (contribute-to-pool (pool-id uint) (amount uint))
+  (let 
+    (
+      (pool (unwrap! (get-insurance-pool pool-id) err-insurance-not-found))
+      (existing-contribution (default-to { contributed-amount: u0, share-percentage: u0, rewards-earned: u0 }
+                              (get-pool-contribution pool-id tx-sender)))
+      (new-total-pool (+ (get total-pool-amount pool) amount))
+      (new-contribution (+ (get contributed-amount existing-contribution) amount))
+    )
+    (asserts! (get is-active pool) err-funding-closed)
+    (asserts! (> amount u0) err-insufficient-funds)
+    
+    ;; Transfer funds to contract
+    (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+    
+    ;; Calculate new share percentage
+    (let ((new-share-percentage (if (> new-total-pool u0)
+                                   (/ (* new-contribution u10000) new-total-pool)
+                                   u10000)))
+      
+      (map-set pool-contributors
+        { pool-id: pool-id, contributor: tx-sender }
+        {
+          contributed-amount: new-contribution,
+          share-percentage: new-share-percentage,
+          rewards-earned: (get rewards-earned existing-contribution)
+        }
+      )
+      
+      (map-set insurance-pools
+        { pool-id: pool-id }
+        (merge pool { total-pool-amount: new-total-pool })
+      )
+      
+      (ok new-contribution)
+    )
+  )
+)
+
+;; Purchase insurance coverage for a farm project
+(define-public (purchase-project-insurance (project-id uint) (pool-id uint) (coverage-duration uint))
+  (let 
+    (
+      (project (unwrap! (get-project project-id) err-not-found))
+      (pool (unwrap! (get-insurance-pool pool-id) err-insurance-not-found))
+      (coverage-amount (get target-amount project))
+      (premium-amount (/ (* coverage-amount (get premium-rate pool)) u10000))
+      (coverage-start stacks-block-height)
+      (coverage-end (+ coverage-start coverage-duration))
+    )
+    (asserts! (is-eq (get farmer project) tx-sender) err-unauthorized)
+    (asserts! (get is-active pool) err-funding-closed)
+    (asserts! (>= premium-amount u1000) err-premium-too-low) ;; Minimum premium
+    (asserts! (<= coverage-amount (get max-claim-amount pool)) (err u303))
+    
+    ;; Transfer premium to contract
+    (try! (stx-transfer? premium-amount tx-sender (as-contract tx-sender)))
+    
+    (map-set project-insurance
+      { project-id: project-id }
+      {
+        pool-id: pool-id,
+        premium-paid: premium-amount,
+        coverage-amount: coverage-amount,
+        coverage-start: coverage-start,
+        coverage-end: coverage-end,
+        is-covered: true
+      }
+    )
+    
+    ;; Update pool's active coverage
+    (map-set insurance-pools
+      { pool-id: pool-id }
+      (merge pool { active-coverage: (+ (get active-coverage pool) coverage-amount) })
+    )
+    
+    (ok premium-amount)
+  )
+)
+
+;; Submit an insurance claim for covered farm project
+(define-public (submit-insurance-claim 
+  (project-id uint) 
+  (claim-type uint) 
+  (claim-amount uint) 
+  (evidence-hash (string-ascii 64)))
+  (let 
+    (
+      (project (unwrap! (get-project project-id) err-not-found))
+      (insurance-info (unwrap! (get-project-insurance-info project-id) err-insurance-not-found))
+      (claim-id (var-get next-claim-id))
+      (current-block stacks-block-height)
+    )
+    (asserts! (is-eq (get farmer project) tx-sender) err-unauthorized)
+    (asserts! (get is-covered insurance-info) err-insurance-not-found)
+    (asserts! (>= current-block (get coverage-start insurance-info)) (err u304))
+    (asserts! (<= current-block (get coverage-end insurance-info)) err-claim-expired)
+    (asserts! (and (>= claim-type u1) (<= claim-type u4)) err-invalid-claim-type)
+    (asserts! (<= claim-amount (get coverage-amount insurance-info)) (err u305))
+    
+    (map-set insurance-claims
+      { claim-id: claim-id }
+      {
+        project-id: project-id,
+        pool-id: (get pool-id insurance-info),
+        claimant: tx-sender,
+        claim-type: claim-type,
+        claim-amount: claim-amount,
+        evidence-hash: evidence-hash,
+        submitted-at: current-block,
+        status: u0, ;; pending
+        votes-for: u0,
+        votes-against: u0,
+        total-voters: u0
+      }
+    )
+    
+    (var-set next-claim-id (+ claim-id u1))
+    (ok claim-id)
+  )
+)
+
+;; Vote on insurance claim (pool contributors can vote)
+(define-public (vote-on-claim (claim-id uint) (approve bool))
+  (let 
+    (
+      (claim (unwrap! (get-insurance-claim claim-id) err-not-found))
+      (pool-id (get pool-id claim))
+      (contribution (unwrap! (get-pool-contribution pool-id tx-sender) err-unauthorized))
+      (existing-vote (default-to { voted: false, vote-type: false, voting-power: u0 }
+                      (get-claim-vote claim-id tx-sender)))
+      (voting-power (get share-percentage contribution))
+    )
+    (asserts! (is-eq (get status claim) u0) err-already-exists) ;; Only pending claims
+    (asserts! (not (get voted existing-vote)) err-already-exists)
+    (asserts! (> voting-power u0) err-unauthorized)
+    
+    (map-set claim-votes
+      { claim-id: claim-id, voter: tx-sender }
+      {
+        voted: true,
+        vote-type: approve,
+        voting-power: voting-power
+      }
+    )
+    
+    (map-set insurance-claims
+      { claim-id: claim-id }
+      (merge claim {
+        votes-for: (if approve (+ (get votes-for claim) voting-power) (get votes-for claim)),
+        votes-against: (if approve (get votes-against claim) (+ (get votes-against claim) voting-power)),
+        total-voters: (+ (get total-voters claim) u1)
+      })
+    )
+    
+    (ok true)
+  )
+)
+
+;; Process approved insurance claim and distribute payout
+(define-public (process-claim-payout (claim-id uint))
+  (let 
+    (
+      (claim (unwrap! (get-insurance-claim claim-id) err-not-found))
+      (pool-id (get pool-id claim))
+      (pool (unwrap! (get-insurance-pool pool-id) err-insurance-not-found))
+      (approval-threshold u5000) ;; 50% approval required
+      (claim-amount (get claim-amount claim))
+    )
+    (asserts! (is-eq (get status claim) u0) err-already-exists) ;; Only pending claims
+    (asserts! (> (get votes-for claim) approval-threshold) (err u306))
+    (asserts! (>= (get total-pool-amount pool) claim-amount) err-insufficient-pool-funds)
+    
+    ;; Update claim status to approved and paid
+    (map-set insurance-claims
+      { claim-id: claim-id }
+      (merge claim { status: u3 }) ;; paid
+    )
+    
+    ;; Update pool amounts
+    (map-set insurance-pools
+      { pool-id: pool-id }
+      (merge pool {
+        total-pool-amount: (- (get total-pool-amount pool) claim-amount),
+        active-coverage: (- (get active-coverage pool) claim-amount),
+        claim-count: (+ (get claim-count pool) u1)
+      })
+    )
+    
+    ;; Transfer payout to claimant
+    (try! (as-contract (stx-transfer? claim-amount tx-sender (get claimant claim))))
+    
+    (ok claim-amount)
+  )
+)
+
