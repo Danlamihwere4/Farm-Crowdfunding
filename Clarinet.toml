@@ -1,0 +1,23 @@
+[project]
+name = 'Farm-Crowdfunding'
+description = ''
+authors = []
+telemetry = true
+cache_dir = '.\.cache'
+requirements = []
+[contracts.Farm-Crowdfunding]
+path = 'contracts/Farm-Crowdfunding.clar'
+clarity_version = 3
+epoch = 3.1
+[contracts.crop-yield-forecasting]
+path = 'contracts/crop-yield-forecasting.clar'
+clarity_version = 3
+epoch = 3.1
+[repl.analysis]
+passes = ['check_checker']
+
+[repl.analysis.check_checker]
+strict = false
+trusted_sender = false
+trusted_caller = false
+callee_filter = false
